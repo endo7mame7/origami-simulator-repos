@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>折り紙シミュレーター</title>
+  <meta name="description" content="ブラウザで紙を折って遊べる 3D 折り紙シミュレーター">
+  <link rel="stylesheet" href="css/style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three/three.module.min.js",
+        "three/addons/": "./vendor/three/addons/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <main id="stage">
+      <canvas id="view" aria-label="折り紙の 3D 表示"></canvas>
+      <div id="hint" role="status"></div>
+      <div id="toast" role="alert"></div>
+      <div id="quickbar">
+        <button id="btn-undo" title="元に戻す (Ctrl+Z)">↶ 戻す</button>
+        <button id="btn-redo" title="やり直す (Ctrl+Y)">↷ やり直す</button>
+        <button id="btn-orbit" class="toggle" title="左ドラッグで視点を回す">⟲ 視点</button>
+        <button id="btn-panel" class="only-mobile" title="メニュー">☰</button>
+      </div>
+    </main>
+
+    <aside id="panel">
+      <header>
+        <h1>折り紙シミュレーター</h1>
+        <p class="sub">線を引いて紙を折ろう</p>
+      </header>
+
+      <section>
+        <h2>折り方</h2>
+        <div class="seg" data-group="input">
+          <button data-value="line" class="on" title="折り線を引いてから、折る側をクリック">線を引く</button>
+          <button data-value="point" title="動かしたい点を、重ねたい点までドラッグ">点を重ねる</button>
+        </div>
+        <div class="seg" data-group="type">
+          <button data-value="valley" class="on" title="手前に折る (V)">谷折り</button>
+          <button data-value="mountain" title="向こう側に折る (M)">山折り</button>
+        </div>
+        <div class="seg" data-group="mode">
+          <button data-value="all" class="on" title="重なっている紙をまとめて折る">すべての層</button>
+          <button data-value="component" title="クリックした所の一番上の部分だけ折る">一番上だけ</button>
+        </div>
+        <div class="row">
+          <button id="btn-flip" title="紙を裏返す (F)">裏返す</button>
+          <button id="btn-rotate" title="紙を 90° 回す (R)">90° 回す</button>
+          <button id="btn-reset" class="danger" title="新しい紙にする">リセット</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>手順 <span id="step-count" class="muted"></span></h2>
+        <div class="row">
+          <button id="btn-replay" title="最初から順に折る">▶ 最初から再生</button>
+          <button id="btn-unfold" title="すべて開く">ひらく</button>
+          <button id="btn-refold" title="すべて折りたたむ">たたむ</button>
+        </div>
+        <ol id="steps"></ol>
+        <p class="muted small">スライダーで各手順の開き具合を変えられます。</p>
+      </section>
+
+      <section>
+        <h2>見本</h2>
+        <div id="presets" class="row wrap"></div>
+      </section>
+
+      <section>
+        <h2>展開図</h2>
+        <canvas id="cp" width="440" height="440" aria-label="展開図"></canvas>
+        <p class="legend small"><span class="lg-m"></span>山折り <span class="lg-v"></span>谷折り</p>
+      </section>
+
+      <section>
+        <h2>紙</h2>
+        <label class="field">形
+          <select id="paper-shape">
+            <option value="square">正方形</option>
+            <option value="a4">長方形（A4 の比率）</option>
+            <option value="strip">細長い（1:2）</option>
+          </select>
+        </label>
+        <label class="field">模様
+          <select id="paper-pattern">
+            <option value="plain">無地</option>
+            <option value="grid">方眼</option>
+            <option value="wave">青海波</option>
+            <option value="dots">水玉</option>
+          </select>
+        </label>
+        <div class="row">
+          <label class="field color">表 <input type="color" id="color-front" value="#e2463f"></label>
+          <label class="field color">裏 <input type="color" id="color-back" value="#fbf8f1"></label>
+        </div>
+        <label class="field">速さ
+          <input type="range" id="speed" min="0.3" max="3" step="0.1" value="1">
+        </label>
+      </section>
+
+      <section>
+        <h2>視点</h2>
+        <div class="row">
+          <button id="btn-view-top">上から</button>
+          <button id="btn-view-angle">斜めから</button>
+          <button id="btn-view-side">横から</button>
+        </div>
+      </section>
+
+      <section class="help small">
+        <h2>使い方</h2>
+        <ul>
+          <li><b>線を引く</b>：紙の上をドラッグして折り線を引き、折りたい側をクリック。</li>
+          <li><b>点を重ねる</b>：動かしたい点（角など）を、重ねたい点までドラッグ。</li>
+          <li>角や辺の中点には自動で吸い付きます。<kbd>Shift</kbd> で角度を 22.5° 単位に。</li>
+          <li>右ドラッグ／2 本指で視点を回転、ホイール／ピンチで拡大縮小。</li>
+          <li><kbd>V</kbd> 谷 / <kbd>M</kbd> 山 / <kbd>F</kbd> 裏返す / <kbd>R</kbd> 回す / <kbd>Esc</kbd> 取り消し</li>
+        </ul>
+      </section>
+    </aside>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
