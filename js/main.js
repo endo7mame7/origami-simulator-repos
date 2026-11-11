@@ -1072,6 +1072,5 @@ window.__origami = {
   playPreset: (id) => playPreset(PRESETS.find((p) => p.id === id)),
   setView,
   camera,
-
   controls,
 };
