@@ -25,6 +25,7 @@
         <button id="btn-undo" title="元に戻す (Ctrl+Z)">↶ 戻す</button>
         <button id="btn-redo" title="やり直す (Ctrl+Y)">↷ やり直す</button>
         <button id="btn-orbit" class="toggle" title="左ドラッグで視点を回す">⟲ 視点</button>
+        <button id="btn-bgm" class="toggle" title="BGM のオン・オフ (B)" aria-pressed="false">♪</button>
         <button id="btn-panel" class="only-mobile" title="メニュー">☰</button>
       </div>
     </main>
@@ -65,6 +66,7 @@
         </div>
         <ol id="steps"></ol>
         <p class="muted small">スライダーで各手順の開き具合を変えられます。</p>
+        <p id="sim-note" class="muted small" hidden>鶴は展開図から物理シミュレーションで一度に折っています。展開図：Origami Simulator（Amanda Ghassaei, MIT License）</p>
       </section>
 
       <section>
@@ -105,6 +107,14 @@
       </section>
 
       <section>
+        <h2>音</h2>
+        <button id="btn-bgm2" class="toggle wide">♪ BGM を流す</button>
+        <label class="field">音量
+          <input type="range" id="bgm-volume" min="0" max="1" step="0.05" value="0.5">
+        </label>
+      </section>
+
+      <section>
         <h2>視点</h2>
         <div class="row">
           <button id="btn-view-top">上から</button>
@@ -120,7 +130,7 @@
           <li><b>点を重ねる</b>：動かしたい点（角など）を、重ねたい点までドラッグ。</li>
           <li>角や辺の中点には自動で吸い付きます。<kbd>Shift</kbd> で角度を 22.5° 単位に。</li>
           <li>右ドラッグ／2 本指で視点を回転、ホイール／ピンチで拡大縮小。</li>
-          <li><kbd>V</kbd> 谷 / <kbd>M</kbd> 山 / <kbd>F</kbd> 裏返す / <kbd>R</kbd> 回す / <kbd>Esc</kbd> 取り消し</li>
+          <li><kbd>V</kbd> 谷 / <kbd>M</kbd> 山 / <kbd>F</kbd> 裏返す / <kbd>R</kbd> 回す / <kbd>B</kbd> BGM / <kbd>Esc</kbd> 取り消し</li>
         </ul>
       </section>
     </aside>
