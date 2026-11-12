@@ -60,6 +60,7 @@ button {
 button:hover { border-color: #cbbfae; background: #fbf8f2; }
 button:disabled { opacity: .4; cursor: default; }
 button.danger { color: var(--accent); }
+button.wide { width: 100%; }
 button.toggle.on, .seg button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 #quickbar button { background: rgba(255,255,255,.9); backdrop-filter: blur(4px); }
 #quickbar button.toggle.on { background: var(--accent); }
@@ -83,7 +84,7 @@ button.toggle.on, .seg button.on { background: var(--accent); border-color: var(
 
 #steps { list-style: none; margin: 8px 0 0; padding: 0; max-height: 240px; overflow-y: auto; }
 #steps li {
-  display: grid; grid-template-columns: 26px 1fr 92px; align-items: center; gap: 6px;
+  display: grid; grid-template-columns: 22px 1fr 84px; align-items: center; gap: 6px;
   padding: 4px 6px; border-radius: 6px; font-size: 13px; cursor: pointer;
 }
 #steps li:hover { background: #f7f1e7; }

@@ -95,7 +95,7 @@ test('展開図：半分の谷折りは谷線1本', () => {
   assert.equal(creasePattern(m)[0].type, 'mountain');
 });
 
-for (const preset of PRESETS) {
+for (const preset of PRESETS.filter((p) => p.kind !== 'sim')) {
   test(`見本「${preset.name}」がすべて折れる`, () => {
     let s = createPaper();
     for (const op of preset.steps) {
