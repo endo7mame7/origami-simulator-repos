@@ -3,7 +3,9 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   createPaper, fold, flip, rotate, makeLine, bisectorLine, sideOf, reflectPoint,
   poseFaces, creasePattern, snapPoints, bounds, cloneState, LAYER_GAP, isFrontUp,
+  squash, reverseFold, addCrease, creaseSegmentsXY, faceAffine, clipToFaceUV,
 } from './paper.js';
+import { VERSION } from './version.js';
 import { PRESETS, applyOp } from './presets.js';
 import { buildModel, FoldSim } from './sim.js';
 import { Bgm } from './bgm.js';
@@ -18,7 +20,7 @@ const PAPER_SHAPES = {
 
 const ui = {
   input: 'line',      // 'line' | 'point'
-  type: 'valley',     // 'valley' | 'mountain'
+  type: 'valley',     // 'valley' | 'mountain' | 'crease' | 'squash' | 'reverse'
   mode: 'all',        // 'all' | 'component'
   orbit: false,
   speed: 1,
@@ -114,6 +116,13 @@ const edges = new THREE.LineSegments(edgeGeom, new THREE.LineBasicMaterial({
   color: 0x3a2a20, transparent: true, opacity: 0.35,
 }));
 scene.add(edges);
+
+// 折り筋（開いた後に残る線）
+const markGeom = new THREE.BufferGeometry();
+const marks = new THREE.LineSegments(markGeom, new THREE.LineBasicMaterial({
+  color: 0x5a4a40, transparent: true, opacity: 0.55,
+}));
+scene.add(marks);
 
 // シミュレーション用のメッシュ（鶴など）
 const simGeom = new THREE.BufferGeometry();
@@ -266,6 +275,30 @@ function rebuildGeometry() {
   paperGeom.computeBoundingSphere();
   edgeGeom.setAttribute('position', new THREE.Float32BufferAttribute(ep, 3));
   edgeGeom.computeBoundingSphere();
+  // 折り筋を、各面の今の姿勢に合わせて描く（表と裏の両方から見えるように少し浮かせる）
+  const mp = [];
+  const cm = state.creaseMarks ?? [];
+  if (cm.length) {
+    for (const { face, pts } of posed) {
+      const map = faceAffine(face, pts);
+      const n = new THREE.Vector3().crossVectors(
+        new THREE.Vector3(...pts[1]).sub(new THREE.Vector3(...pts[0])),
+        new THREE.Vector3(...pts[2]).sub(new THREE.Vector3(...pts[0])),
+      ).normalize().multiplyScalar(0.0012);
+      for (const m of cm) {
+        const r = clipToFaceUV(face, m.a, m.b);
+        if (!r) continue;
+        const at = (t) => map(m.a.u + (m.b.u - m.a.u) * t, m.a.v + (m.b.v - m.a.v) * t);
+        const a = at(r[0]);
+        const b = at(r[1]);
+        for (const sg of [1, -1]) {
+          mp.push(a[0] + n.x * sg, a[1] + n.y * sg, a[2] + n.z * sg, b[0] + n.x * sg, b[1] + n.y * sg, b[2] + n.z * sg);
+        }
+      }
+    }
+  }
+  markGeom.setAttribute('position', new THREE.Float32BufferAttribute(mp, 3));
+  markGeom.computeBoundingSphere();
   lastPoseMinZ = minZ;
   ground.position.z = Math.min(0, minZ) - 0.02;
 }
@@ -315,7 +348,7 @@ async function enterSim(preset) {
   const uv = [];
   for (const t of model.tris) for (const v of t) uv.push((model.uv[v][0] + 1) / 2, (model.uv[v][1] + 1) / 2);
   simGeom.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
-  frontMesh.visible = backMesh.visible = edges.visible = false;
+  frontMesh.visible = backMesh.visible = edges.visible = marks.visible = false;
   simGroup.visible = true;
   dirty = true;
   renderSteps();
@@ -325,7 +358,7 @@ async function enterSim(preset) {
 function exitSim() {
   if (!simMode) return;
   simMode = null;
-  frontMesh.visible = backMesh.visible = edges.visible = true;
+  frontMesh.visible = backMesh.visible = edges.visible = marks.visible = true;
   simGroup.visible = false;
   dirty = true;
 }
@@ -410,6 +443,17 @@ function animateAngles(targets, baseDuration = 700) {
   });
 }
 
+// 同時に動く手順（つぶし折りなど）をまとめる
+function stepGroups() {
+  const groups = [];
+  state.steps.forEach((s, i) => {
+    const last = groups[groups.length - 1];
+    if (last && s.group && state.steps[last[0]].group === s.group) last.push(i);
+    else groups.push([i]);
+  });
+  return groups;
+}
+
 function fullAngle(step) {
   return step.kind === 'rotate' ? step.full : 180;
 }
@@ -449,30 +493,54 @@ async function commit(result, targetAngle) {
   state = result.state;
   // 既存の手順の角度は引き継ぐ
   prevSteps.forEach((s, i) => { state.steps[i].angle = s.angle; });
-  const idx = state.steps.length - 1;
-  const step = state.steps[idx];
-  const goal = targetAngle ?? fullAngle(step);
-  step.angle = 0;
-  currentStep = idx;
+  // 新しい手順（つぶし折りなどは複数の手順を同時に動かす）
+  const targets = {};
+  for (let i = prevSteps.length; i < state.steps.length; i++) {
+    targets[i] = targetAngle ?? fullAngle(state.steps[i]);
+    state.steps[i].angle = 0;
+  }
+  currentStep = prevSteps.length;
   dirty = true;
   renderSteps();
   drawCreasePattern();
-  await animateAngles({ [idx]: goal });
+  await animateAngles(targets);
   recenter();
   return true;
 }
 
 // ================================================================ 操作
 
+// 今の設定で折った結果を計算する（プレビューにも使う）
+function computeFold(line, side, pick) {
+  const p = pick && { ...pick, select: viewFromBelow() ? 'bottom' : 'top' };
+  if (ui.type === 'squash') return squash(state, { line, side, pick: p });
+  if (ui.type === 'reverse') return reverseFold(state, { line, side, pick: p });
+  const type = ui.type === 'crease' ? 'valley' : ui.type;
+  return fold(state, { line, side, type, mode: ui.mode, pick: p });
+}
+
 function doFold(line, side, pick) {
   if (simBlocked()) return;
   return runBusy(async () => {
     await flattenAll();
-    const r = fold(state, {
-      line, side, type: ui.type, mode: ui.mode,
-      pick: pick && { ...pick, select: viewFromBelow() ? 'bottom' : 'top' },
-    });
-    await commit(r);
+    if (ui.type === 'crease') {
+      // 折ってから開いて、折り筋だけを残す
+      const before = cloneState(state);
+      const c = addCrease(state, { line, side, mode: ui.mode, pick: pick && { ...pick, select: viewFromBelow() ? 'bottom' : 'top' } });
+      if (c.error) { toast(c.error); return; }
+      if (!c.marks.length) { toast('折り筋がつきませんでした'); return; }
+      if (!(await commit({ state: c.folded }))) return;
+      await wait(120 / ui.speed);
+      const idx = state.steps.length - 1;
+      await animateAngles({ [idx]: 0 }, 600);
+      const angles = before.steps.map((st, i) => state.steps[i].angle);
+      state = c.state;
+      state.steps.forEach((st, i) => { st.angle = angles[i]; });
+      dirty = true;
+      drawCreasePattern();
+      return;
+    }
+    await commit(computeFold(line, side, pick));
   });
 }
 
@@ -498,8 +566,11 @@ function undo() {
   }
   if (!undoStack.length) return;
   runBusy(async () => {
-    const idx = state.steps.length - 1;
-    if (idx >= 0) await animateAngles({ [idx]: 0 });
+    // この操作で増えた手順だけを開く（折り筋は手順が増えないので、そのまま戻す）
+    const prevLen = undoStack[undoStack.length - 1].steps.length;
+    const t = {};
+    for (let i = prevLen; i < state.steps.length; i++) t[i] = 0;
+    await animateAngles(t);
     redoStack.push(cloneState(state));
     // 元に戻した時の角度は今の角度を引き継ぐ
     const angles = state.steps.map((s) => s.angle);
@@ -516,15 +587,16 @@ function redo() {
   runBusy(async () => {
     const next = redoStack.pop();
     undoStack.push(cloneState(state));
-    const idx = next.steps.length - 1;
-    const goal = next.steps[idx]?.angle ?? 180;
+    const prevLen = state.steps.length;
+    const goals = {};
+    for (let i = prevLen; i < next.steps.length; i++) goals[i] = next.steps[i].angle;
     state.steps.forEach((s, i) => { next.steps[i].angle = s.angle; });
     state = next;
-    if (idx >= 0) {
-      state.steps[idx].angle = 0;
-      currentStep = idx;
+    if (next.steps.length > prevLen) {
+      for (const i of Object.keys(goals)) state.steps[i].angle = 0;
+      currentStep = prevLen;
       renderSteps();
-      await animateAngles({ [idx]: goal });
+      await animateAngles(goals);
     }
     dirty = true;
     drawCreasePattern();
@@ -560,10 +632,12 @@ function replay() {
     state.steps.forEach((s, i) => { all[i] = 0; });
     await animateAngles(all, 600);
     await wait(250);
-    for (let i = 0; i < state.steps.length; i++) {
-      currentStep = i;
+    for (const g of stepGroups()) {
+      currentStep = g[0];
       renderSteps();
-      await animateAngles({ [i]: targets[i] });
+      const t = {};
+      for (const i of g) t[i] = targets[i];
+      await animateAngles(t);
       await wait(120 / ui.speed);
     }
   });
@@ -583,8 +657,10 @@ function goToStep(i) {
   if (simMode) return;
   runBusy(async () => {
     const t = {};
-    state.steps.forEach((s, j) => { t[j] = j <= i ? fullAngle(s) : 0; });
-    currentStep = i;
+    const last = stepGroups().find((g) => g.includes(i)) ?? [i];
+    const end = last[last.length - 1];
+    state.steps.forEach((s, j) => { t[j] = j <= end ? fullAngle(s) : 0; });
+    currentStep = last[0];
     renderSteps();
     await animateAngles(t, 700);
   });
@@ -649,8 +725,32 @@ function snapRadius() {
 
 let snapCache = null;
 function getSnapPoints() {
-  if (!snapCache || snapCache.state !== state) snapCache = { state, pts: snapPoints(state) };
+  if (!snapCache || snapCache.state !== state) {
+    const pts = snapPoints(state);
+    // 折り筋の端と、折り筋どうしの交点
+    const segs = creaseSegmentsXY(state);
+    for (const sg of segs) pts.push({ ...sg.a, kind: 'vertex' }, { ...sg.b, kind: 'vertex' });
+    for (let i = 0; i < segs.length; i++) {
+      for (let j = i + 1; j < segs.length; j++) {
+        const p = segIntersect(segs[i], segs[j]);
+        if (p) pts.push({ ...p, kind: 'vertex' });
+      }
+    }
+    snapCache = { state, pts, segs };
+  }
   return snapCache.pts;
+}
+
+function segIntersect(s1, s2) {
+  const rx = s1.b.x - s1.a.x, ry = s1.b.y - s1.a.y;
+  const sx = s2.b.x - s2.a.x, sy = s2.b.y - s2.a.y;
+  const den = rx * sy - ry * sx;
+  if (Math.abs(den) < 1e-12) return null;
+  const qx = s2.a.x - s1.a.x, qy = s2.a.y - s1.a.y;
+  const t = (qx * sy - qy * sx) / den;
+  const u = (qx * ry - qy * rx) / den;
+  if (t < -1e-6 || t > 1 + 1e-6 || u < -1e-6 || u > 1 + 1e-6) return null;
+  return { x: s1.a.x + rx * t, y: s1.a.y + ry * t };
 }
 
 function snap(pt) {
@@ -664,7 +764,19 @@ function snap(pt) {
     const dd = s.kind === 'vertex' ? d * 0.7 : d;
     if (dd < bd) { bd = dd; best = s; }
   }
-  return best ? { pt: { x: best.x, y: best.y }, snapped: true } : { pt, snapped: false };
+  if (best) return { pt: { x: best.x, y: best.y }, snapped: true };
+  // 点がなければ、折り筋の線の上に吸い付く
+  let bl = r * 0.8;
+  let onSeg = null;
+  for (const sg of snapCache?.segs ?? []) {
+    const dx = sg.b.x - sg.a.x, dy = sg.b.y - sg.a.y;
+    const L2 = dx * dx + dy * dy;
+    const t = Math.max(0, Math.min(1, ((pt.x - sg.a.x) * dx + (pt.y - sg.a.y) * dy) / L2));
+    const q = { x: sg.a.x + dx * t, y: sg.a.y + dy * t };
+    const d = Math.hypot(q.x - pt.x, q.y - pt.y);
+    if (d < bl) { bl = d; onSeg = q; }
+  }
+  return onSeg ? { pt: onSeg, snapped: true } : { pt, snapped: false };
 }
 
 function snapAngle(start, end) {
@@ -760,6 +872,11 @@ canvas.addEventListener('pointerup', (ev) => {
     if (len < 0.03) {
       cancelInput();
       if (wasDown.phase !== 'choose') updateHint('紙の上をドラッグして折り線を引いてください');
+      return;
+    }
+    if (ui.input === 'point' && ui.type === 'squash') {
+      cancelInput();
+      toast('「袋をつぶす」は「線」モードで、袋のつけ根に線を引いてください');
       return;
     }
     if (ui.input === 'point') {
@@ -879,20 +996,24 @@ function updatePreview() {
   const L = 6;
   const a = { x: line.p.x - line.d.x * L, y: line.p.y - line.d.y * L };
   const b = { x: line.p.x + line.d.x * L, y: line.p.y + line.d.y * L };
-  foldLineMat.color.set(ui.type === 'valley' ? 0x2f6fd6 : 0xd2392b);
+  foldLineMat.color.set({ valley: 0x2f6fd6, mountain: 0xd2392b, crease: 0x6b5a4e, squash: 0x7a3fb0, reverse: 0x0f8a6a }[ui.type]);
   previewGroup.add(lineQuad(a, b, w, z, foldLineMat));
 
   if (!side) return;
   // 動く部分の強調表示と、折った後の位置（点線）
-  const r = fold(state, {
-    line, side, type: ui.type, mode: ui.mode,
-    pick: pick && { ...pick, select: viewFromBelow() ? 'bottom' : 'top' },
-  });
+  if (ui.type === 'squash' && ui.input === 'point') return;
+  const r = computeFold(line, side, pick);
   if (r.error) return;
-  const idx = r.state.steps.length - 1;
+  const first = state.steps.length;
   for (const f of r.state.faces) {
-    if (!f.moves.includes(idx)) continue;
-    const orig = f.verts.map((v) => reflectPoint(line, v));
+    const mine = f.moves.filter((k) => k >= first);
+    if (!mine.length) continue;
+    // 新しい手順の鏡映を逆にたどって、元の位置を求める
+    let orig = f.verts.map((v) => ({ x: v.x, y: v.y }));
+    for (let q = mine.length - 1; q >= 0; q--) {
+      const st = r.state.steps[mine[q]];
+      orig = orig.map((v) => reflectPoint(st, v));
+    }
     const pos = [];
     for (let i = 1; i < orig.length - 1; i++) {
       for (const j of [0, i, i + 1]) pos.push(orig[j].x, orig[j].y, z - 0.001);
@@ -997,11 +1118,14 @@ function updateHint(msg) {
   if (ui.orbit) { el.textContent = 'ドラッグで視点を回転中（「⟲ 視点」で折るモードに戻ります）'; return; }
   if (simMode) { el.textContent = '右ドラッグ（2 本指）で回して見てみよう。スライダーで折り具合を変えられます'; return; }
   if (input.phase === 'choose') {
-    el.textContent = ui.mode === 'component'
-      ? '折りたい部分をクリック（Esc で取り消し）'
+    el.textContent = ui.type === 'squash' ? 'つぶしたい袋をクリック（Esc で取り消し）'
+      : ui.type === 'reverse' ? '折り込みたい袋の先をクリック（Esc で取り消し）'
+      : ui.mode === 'component' ? '折りたい部分をクリック（Esc で取り消し）'
       : '折りたい側をクリック（Esc で取り消し）';
     return;
   }
+  if (ui.type === 'squash') { el.textContent = '袋のつけ根（ちょうつがいの折り目）に沿って線を引こう'; return; }
+  if (ui.type === 'reverse') { el.textContent = '袋の途中に折り線を引いて、折り込む先をクリック'; return; }
   if (ui.input === 'point') {
     el.textContent = '動かしたい点を、重ねたい点までドラッグ';
   } else {
@@ -1012,7 +1136,9 @@ function updateHint(msg) {
 }
 
 function stepLabel(s) {
-  const cls = s.kind === 'rotate' || s.type === 'flip' ? 'other' : s.type;
+  const cls = s.kind === 'rotate' || s.type === 'flip' ? 'other'
+    : s.type === 'squash' || s.type === 'reverse' ? 'special' : s.type;
+  if (s.label && !s.caption) return { text: s.label, cls };
   if (s.caption) return { text: s.caption, cls };
   if (s.kind === 'rotate') return { text: `${Math.round(s.full)}° 回す`, cls };
   if (s.type === 'flip') return { text: '裏返す', cls };
@@ -1041,11 +1167,14 @@ function renderSteps() {
     $('step-count').textContent = '';
     return;
   }
-  state.steps.forEach((s, i) => {
+  const groups = stepGroups();
+  groups.forEach((g, n) => {
+    const i = g[0];
+    const s = state.steps[i];
     const li = document.createElement('li');
-    if (i === currentStep) li.classList.add('current');
+    if (g.includes(currentStep)) li.classList.add('current');
     const { text, cls } = stepLabel(s);
-    li.innerHTML = `<span class="num">${i + 1}</span><span><span class="tag ${cls}"></span>${text}</span>`;
+    li.innerHTML = `<span class="num">${n + 1}</span><span><span class="tag ${cls}"></span>${text}</span>`;
     if (s.kind === 'fold' && s.type !== 'flip') {
       const r = document.createElement('input');
       r.type = 'range'; r.min = 0; r.max = 180; r.step = 1; r.value = s.angle;
@@ -1055,7 +1184,7 @@ function renderSteps() {
       r.addEventListener('click', (e) => e.stopPropagation());
       r.addEventListener('input', () => {
         if (busy) { r.value = state.steps[i].angle; return; }
-        state.steps[i].angle = +r.value;
+        for (const j of g) state.steps[j].angle = +r.value;
         cancelInput();
         dirty = true;
       });
@@ -1067,8 +1196,9 @@ function renderSteps() {
     li.addEventListener('click', () => goToStep(i));
     ol.appendChild(li);
   });
-  $('step-count').textContent = state.steps.length ? `${state.steps.length} 手` : '';
-  if (currentStep >= 0) ol.children[currentStep]?.scrollIntoView({ block: 'nearest' });
+  $('step-count').textContent = groups.length ? `${groups.length} 手` : '';
+  const cur = groups.findIndex((g) => g.includes(currentStep));
+  if (cur >= 0) ol.children[cur]?.scrollIntoView({ block: 'nearest' });
 }
 
 function syncStepSliders() {
@@ -1092,13 +1222,14 @@ function updateButtons() {
 }
 
 function bindSeg(group, key, after) {
-  const el = document.querySelector(`.seg[data-group="${group}"]`);
-  el.addEventListener('click', (e) => {
-    const b = e.target.closest('button');
-    if (!b) return;
-    setSeg(group, key, b.dataset.value);
-    after?.();
-  });
+  for (const el of document.querySelectorAll(`.seg[data-group="${group}"]`)) {
+    el.addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      setSeg(group, key, b.dataset.value);
+      after?.();
+    });
+  }
 }
 
 function setSeg(group, key, value) {
@@ -1111,7 +1242,7 @@ function setSeg(group, key, value) {
 }
 
 bindSeg('input', 'input', cancelInput);
-bindSeg('type', 'type');
+bindSeg('type', 'type', () => { if (input.phase === 'choose') updatePreview(); });
 bindSeg('mode', 'mode');
 
 $('btn-undo').onclick = undo;
@@ -1193,6 +1324,13 @@ window.addEventListener('keydown', (e) => {
   if (k === 'escape') cancelInput();
   else if (k === 'v') setSeg('type', 'type', 'valley');
   else if (k === 'm') setSeg('type', 'type', 'mountain');
+  else if (k === 'c') setSeg('type', 'type', 'crease');
+  else if (k === 's') setSeg('type', 'type', 'squash');
+  else if (k === 'i') setSeg('type', 'type', 'reverse');
+  else if (k === 'l') { setSeg('input', 'input', 'line'); cancelInput(); }
+  else if (k === 'p') { setSeg('input', 'input', 'point'); cancelInput(); }
+  else if (k === 'a') setSeg('mode', 'mode', 'all');
+  else if (k === 't') setSeg('mode', 'mode', 'component');
   else if (k === 'f') doFlip();
   else if (k === 'r') doRotate();
   else if (k === 'b') toggleBgm();
@@ -1252,6 +1390,18 @@ function drawCreasePattern() {
   g.setLineDash([]);
   g.strokeRect(tx(-pw / 2), ty(ph / 2), pw * scale, ph * scale);
 
+  // 折り筋（灰色の細い線）
+  g.strokeStyle = 'rgba(90,74,64,.6)';
+  g.setLineDash([3, 3]);
+  g.lineWidth = 1.2;
+  for (const m of state.creaseMarks ?? []) {
+    g.beginPath();
+    g.moveTo(tx(m.a.u), ty(m.a.v));
+    g.lineTo(tx(m.b.u), ty(m.b.v));
+    g.stroke();
+  }
+  g.setLineDash([]);
+
   for (const cr of creasePattern(state)) {
     if (cr.type === 'flat') {
       g.strokeStyle = 'rgba(0,0,0,.18)';
@@ -1307,6 +1457,7 @@ function loop() {
   renderer.render(scene, camera);
 }
 
+$('version').textContent = `v${VERSION}`;
 updateTextures();
 resize();
 renderSteps();
