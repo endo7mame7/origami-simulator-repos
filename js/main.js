@@ -3,11 +3,10 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   createPaper, fold, flip, rotate, makeLine, bisectorLine, sideOf, reflectPoint,
   poseFaces, creasePattern, snapPoints, bounds, cloneState, LAYER_GAP, isFrontUp,
-  squash, reverseFold, addCrease, creaseSegmentsXY, faceAffine, clipToFaceUV,
+  squash, reverseFold, petalFold, addCrease, creaseSegmentsXY, faceAffine, clipToFaceUV,
 } from './paper.js';
 import { VERSION } from './version.js';
 import { PRESETS, applyOp } from './presets.js';
-import { buildModel, FoldSim } from './sim.js';
 import { Bgm } from './bgm.js';
 
 // ================================================================ 状態
@@ -36,9 +35,6 @@ let redoStack = [];
 let busy = false;
 let dirty = true;
 let currentStep = -1; // 再生中などに強調する手順
-// 鶴のように展開図からシミュレーションで折る見本を表示しているとき
-// { preset, model, sim, frames: [{ p, pos }], q (0..1 表示中の折り具合), full }
-let simMode = null;
 
 // 入力の状態
 const input = {
@@ -124,18 +120,6 @@ const marks = new THREE.LineSegments(markGeom, new THREE.LineBasicMaterial({
 }));
 scene.add(marks);
 
-// シミュレーション用のメッシュ（鶴など）
-const simGeom = new THREE.BufferGeometry();
-const simFront = new THREE.Mesh(simGeom, frontMat);
-const simBack = new THREE.Mesh(simGeom, backMat);
-simFront.castShadow = simBack.castShadow = true;
-simFront.receiveShadow = simBack.receiveShadow = true;
-const simEdgeGeom = new THREE.BufferGeometry();
-const simEdges = new THREE.LineSegments(simEdgeGeom, edges.material);
-const simGroup = new THREE.Group();
-simGroup.add(simFront, simBack, simEdges);
-simGroup.visible = false;
-scene.add(simGroup);
 
 // 折り線のプレビュー
 const previewGroup = new THREE.Group();
@@ -245,7 +229,6 @@ function updateTextures() {
 let lastPoseMinZ = 0;
 
 function rebuildGeometry() {
-  if (simMode) { rebuildSimGeometry(); return; }
   const posed = poseFaces(state);
   const pos = [];
   const uv = [];
@@ -301,117 +284,6 @@ function rebuildGeometry() {
   markGeom.computeBoundingSphere();
   lastPoseMinZ = minZ;
   ground.position.z = Math.min(0, minZ) - 0.02;
-}
-
-// ================================================================ シミュレーションで折る見本（鶴）
-
-function simPositions(q) {
-  const { frames, full } = simMode;
-  const p = q * full;
-  let i = 1;
-  while (i < frames.length - 1 && frames[i].p < p) i++;
-  const a = frames[i - 1];
-  const b = frames[i] ?? a;
-  const t = b.p > a.p ? Math.min(1, Math.max(0, (p - a.p) / (b.p - a.p))) : 1;
-  const out = new Float32Array(a.pos.length);
-  for (let k = 0; k < out.length; k++) out[k] = a.pos[k] + (b.pos[k] - a.pos[k]) * t;
-  return out;
-}
-
-function rebuildSimGeometry() {
-  const { model } = simMode;
-  const P = simPositions(simMode.q);
-  const pos = [];
-  let minZ = Infinity;
-  for (const t of model.tris) {
-    for (const v of t) {
-      pos.push(P[3 * v], P[3 * v + 1], P[3 * v + 2]);
-      minZ = Math.min(minZ, P[3 * v + 2]);
-    }
-  }
-  simGeom.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  simGeom.deleteAttribute('normal');
-  simGeom.computeVertexNormals();
-  simGeom.computeBoundingSphere();
-  const ep = [];
-  for (const [i, j] of model.creaseLines) ep.push(P[3 * i], P[3 * i + 1], P[3 * i + 2], P[3 * j], P[3 * j + 1], P[3 * j + 2]);
-  simEdgeGeom.setAttribute('position', new THREE.Float32BufferAttribute(ep, 3));
-  simEdgeGeom.computeBoundingSphere();
-  ground.position.z = Math.min(0, minZ) - 0.02;
-}
-
-async function enterSim(preset) {
-  const { CRANE_CP } = await import('./data/crane-cp.js');
-  const model = buildModel(CRANE_CP, 2);
-  const sim = new FoldSim(model);
-  simMode = { preset, model, sim, frames: [{ p: 0, pos: Float32Array.from(sim.pos) }], q: 0, full: 0.99 };
-  const uv = [];
-  for (const t of model.tris) for (const v of t) uv.push((model.uv[v][0] + 1) / 2, (model.uv[v][1] + 1) / 2);
-  simGeom.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
-  frontMesh.visible = backMesh.visible = edges.visible = marks.visible = false;
-  simGroup.visible = true;
-  dirty = true;
-  renderSteps();
-  drawCreasePattern();
-}
-
-function exitSim() {
-  if (!simMode) return;
-  simMode = null;
-  frontMesh.visible = backMesh.visible = edges.visible = marks.visible = true;
-  simGroup.visible = false;
-  dirty = true;
-}
-
-// 物理シミュレーションを進めながら折る（途中の形を記録して、あとでスライダーで見られるようにする）
-function runSimFold() {
-  return new Promise((resolve) => {
-    const { sim, frames, full } = simMode;
-    const N = Math.round(240 / ui.speed);
-    const settle = 40;
-    let f = 0;
-    const tick = () => {
-      if (!simMode) { resolve(); return; }
-      f++;
-      const p = Math.min(1, f / N) * full;
-      sim.percent = p;
-      sim.step(120);
-      const last = frames[frames.length - 1];
-      const rec = { p, pos: Float32Array.from(sim.pos) };
-      if (last.p === p) frames[frames.length - 1] = rec; else frames.push(rec);
-      simMode.q = p / full;
-      dirty = true;
-      syncStepSliders();
-      if (f < N + settle) requestAnimationFrame(tick);
-      else resolve();
-    };
-    requestAnimationFrame(tick);
-  });
-}
-
-function animateSim(to, baseDuration = 2500) {
-  const from = simMode.q;
-  if (from === to) return Promise.resolve();
-  const duration = (baseDuration * Math.max(0.3, Math.abs(to - from))) / ui.speed;
-  return new Promise((resolve) => {
-    const t0 = performance.now();
-    const tick = (now) => {
-      if (!simMode) { resolve(); return; }
-      const t = Math.min(1, (now - t0) / duration);
-      simMode.q = from + (to - from) * easeInOut(t);
-      dirty = true;
-      syncStepSliders();
-      if (t < 1) requestAnimationFrame(tick);
-      else resolve();
-    };
-    requestAnimationFrame(tick);
-  });
-}
-
-function simBlocked() {
-  if (!simMode) return false;
-  toast(`「${simMode.preset.name}」の見本を表示中です。「リセット」で新しい紙に戻ります`);
-  return true;
 }
 
 // ================================================================ アニメーション
@@ -515,12 +387,12 @@ function computeFold(line, side, pick) {
   const p = pick && { ...pick, select: viewFromBelow() ? 'bottom' : 'top' };
   if (ui.type === 'squash') return squash(state, { line, side, pick: p });
   if (ui.type === 'reverse') return reverseFold(state, { line, side, pick: p });
+  if (ui.type === 'petal') return petalFold(state, { line, side, pick: p });
   const type = ui.type === 'crease' ? 'valley' : ui.type;
   return fold(state, { line, side, type, mode: ui.mode, pick: p });
 }
 
 function doFold(line, side, pick) {
-  if (simBlocked()) return;
   return runBusy(async () => {
     await flattenAll();
     if (ui.type === 'crease') {
@@ -545,25 +417,14 @@ function doFold(line, side, pick) {
 }
 
 function doFlip() {
-  if (simBlocked()) return;
   return runBusy(async () => { await flattenAll(); await commit(flip(state)); });
 }
 
 function doRotate() {
-  if (simBlocked()) return;
   return runBusy(async () => { await flattenAll(); await commit(rotate(state, 90)); });
 }
 
 function undo() {
-  if (simMode && !busy) {
-    exitSim();
-    renderSteps();
-    drawCreasePattern();
-    recenter();
-    updateButtons();
-    updateHint();
-    return;
-  }
   if (!undoStack.length) return;
   runBusy(async () => {
     // この操作で増えた手順だけを開く（折り筋は手順が増えないので、そのまま戻す）
@@ -583,7 +444,7 @@ function undo() {
 }
 
 function redo() {
-  if (!redoStack.length || simMode) return;
+  if (!redoStack.length) return;
   runBusy(async () => {
     const next = redoStack.pop();
     undoStack.push(cloneState(state));
@@ -608,7 +469,6 @@ function reset(shape = ui.shape) {
   if (busy) return;
   if (state.steps.length) undoStack.push(cloneState(state));
   redoStack = [];
-  exitSim();
   ui.shape = shape;
   state = createPaper(...PAPER_SHAPES[shape]);
   updateTextures();
@@ -621,10 +481,6 @@ function reset(shape = ui.shape) {
 }
 
 function replay() {
-  if (simMode) {
-    runBusy(async () => { await animateSim(0, 900); await wait(250); await animateSim(1, 4000); });
-    return;
-  }
   if (!state.steps.length) return;
   runBusy(async () => {
     const targets = state.steps.map((s) => (s.angle > 0 ? s.angle : fullAngle(s)));
@@ -644,7 +500,6 @@ function replay() {
 }
 
 function setAllAngles(open) {
-  if (simMode) { runBusy(() => animateSim(open ? 0 : 1)); return; }
   runBusy(async () => {
     const t = {};
     state.steps.forEach((s, i) => { t[i] = open ? 0 : fullAngle(s); });
@@ -654,7 +509,6 @@ function setAllAngles(open) {
 
 // i 番目の手順まで折った状態を見せる
 function goToStep(i) {
-  if (simMode) return;
   runBusy(async () => {
     const t = {};
     const last = stepGroups().find((g) => g.includes(i)) ?? [i];
@@ -672,22 +526,13 @@ function playPreset(preset) {
     document.getElementById('paper-shape').value = 'square';
   }
   reset('square');
-  if (preset.kind === 'sim') {
-    runBusy(async () => {
-      await enterSim(preset);
-      if (preset.credit) toast(preset.credit);
-      await runSimFold();
-      recenter();
-      if (preset.view) moveCamera(preset.view);
-    });
-    return;
-  }
   runBusy(async () => {
     await wait(200);
     for (const op of preset.steps) {
+      const first = state.steps.length;
       const ok = await commit(applyOp(state, op));
       if (!ok) break;
-      state.steps[state.steps.length - 1].caption = op.caption;
+      if (state.steps[first]) state.steps[first].caption = op.caption;
       renderSteps();
       await wait(150 / ui.speed);
     }
@@ -805,7 +650,6 @@ canvas.addEventListener('pointerdown', (ev) => {
     if (ev.button === 2 && input.phase === 'choose') cancelInput();
     return;
   }
-  if (simBlocked()) return;
   if (anyPartial()) {
     toast('開いている手順があります。「たたむ」で折りたたんでから折ってください');
     return;
@@ -874,9 +718,9 @@ canvas.addEventListener('pointerup', (ev) => {
       if (wasDown.phase !== 'choose') updateHint('紙の上をドラッグして折り線を引いてください');
       return;
     }
-    if (ui.input === 'point' && ui.type === 'squash') {
+    if (ui.input === 'point' && (ui.type === 'squash' || ui.type === 'petal')) {
       cancelInput();
-      toast('「袋をつぶす」は「線」モードで、袋のつけ根に線を引いてください');
+      toast('「袋をつぶす」と「花弁折り」は「線」モードで線を引いてください');
       return;
     }
     if (ui.input === 'point') {
@@ -996,12 +840,12 @@ function updatePreview() {
   const L = 6;
   const a = { x: line.p.x - line.d.x * L, y: line.p.y - line.d.y * L };
   const b = { x: line.p.x + line.d.x * L, y: line.p.y + line.d.y * L };
-  foldLineMat.color.set({ valley: 0x2f6fd6, mountain: 0xd2392b, crease: 0x6b5a4e, squash: 0x7a3fb0, reverse: 0x0f8a6a }[ui.type]);
+  foldLineMat.color.set({ valley: 0x2f6fd6, mountain: 0xd2392b, crease: 0x6b5a4e, squash: 0x7a3fb0, reverse: 0x0f8a6a, petal: 0xc06a12 }[ui.type]);
   previewGroup.add(lineQuad(a, b, w, z, foldLineMat));
 
   if (!side) return;
   // 動く部分の強調表示と、折った後の位置（点線）
-  if (ui.type === 'squash' && ui.input === 'point') return;
+  if ((ui.type === 'squash' || ui.type === 'petal') && ui.input === 'point') return;
   const r = computeFold(line, side, pick);
   if (r.error) return;
   const first = state.steps.length;
@@ -1044,12 +888,6 @@ function updatePreview() {
 let targetGoal = new THREE.Vector3();
 
 function recenter(immediate = false) {
-  if (simMode) {
-    simGeom.computeBoundingBox();
-    const box = simGeom.boundingBox;
-    if (box) box.getCenter(targetGoal);
-    return;
-  }
   const b = bounds(state);
   targetGoal.set(b.cx, b.cy, 0);
   if (immediate) {
@@ -1116,16 +954,17 @@ function updateHint(msg) {
   if (msg) { el.textContent = msg; return; }
   if (busy) { el.textContent = ''; return; }
   if (ui.orbit) { el.textContent = 'ドラッグで視点を回転中（「⟲ 視点」で折るモードに戻ります）'; return; }
-  if (simMode) { el.textContent = '右ドラッグ（2 本指）で回して見てみよう。スライダーで折り具合を変えられます'; return; }
   if (input.phase === 'choose') {
     el.textContent = ui.type === 'squash' ? 'つぶしたい袋をクリック（Esc で取り消し）'
       : ui.type === 'reverse' ? '折り込みたい袋の先をクリック（Esc で取り消し）'
+      : ui.type === 'petal' ? '持ち上げる角の側をクリック（Esc で取り消し）'
       : ui.mode === 'component' ? '折りたい部分をクリック（Esc で取り消し）'
       : '折りたい側をクリック（Esc で取り消し）';
     return;
   }
   if (ui.type === 'squash') { el.textContent = '袋のつけ根（ちょうつがいの折り目）に沿って線を引こう'; return; }
   if (ui.type === 'reverse') { el.textContent = '袋の途中に折り線を引いて、折り込む先をクリック'; return; }
+  if (ui.type === 'petal') { el.textContent = '花弁のつけ根の横線を、1 枚目の左右のふちの間に引こう'; return; }
   if (ui.input === 'point') {
     el.textContent = '動かしたい点を、重ねたい点までドラッグ';
   } else {
@@ -1137,7 +976,7 @@ function updateHint(msg) {
 
 function stepLabel(s) {
   const cls = s.kind === 'rotate' || s.type === 'flip' ? 'other'
-    : s.type === 'squash' || s.type === 'reverse' ? 'special' : s.type;
+    : s.type === 'squash' || s.type === 'reverse' || s.type === 'petal' ? 'special' : s.type;
   if (s.label && !s.caption) return { text: s.label, cls };
   if (s.caption) return { text: s.caption, cls };
   if (s.kind === 'rotate') return { text: `${Math.round(s.full)}° 回す`, cls };
@@ -1149,24 +988,6 @@ function stepLabel(s) {
 function renderSteps() {
   const ol = $('steps');
   ol.innerHTML = '';
-  $('sim-note').hidden = !simMode;
-  if (simMode) {
-    const li = document.createElement('li');
-    li.innerHTML = '<span class="num">1</span><span><span class="tag valley"></span>折り目にそって一度に折る</span>';
-    const r = document.createElement('input');
-    r.type = 'range'; r.min = 0; r.max = 100; r.step = 0.5; r.value = simMode.q * 100;
-    r.title = '折り具合';
-    r.dataset.sim = '1';
-    r.addEventListener('input', () => {
-      if (busy) { r.value = simMode.q * 100; return; }
-      simMode.q = +r.value / 100;
-      dirty = true;
-    });
-    li.appendChild(r);
-    ol.appendChild(li);
-    $('step-count').textContent = '';
-    return;
-  }
   const groups = stepGroups();
   groups.forEach((g, n) => {
     const i = g[0];
@@ -1202,11 +1023,6 @@ function renderSteps() {
 }
 
 function syncStepSliders() {
-  if (simMode) {
-    const r = $('steps').querySelector('input[data-sim]');
-    if (r) r.value = simMode.q * 100;
-    return;
-  }
   for (const r of $('steps').querySelectorAll('input[type=range]')) {
     const s = state.steps[+r.dataset.idx];
     if (s) r.value = s.angle;
@@ -1214,9 +1030,9 @@ function syncStepSliders() {
 }
 
 function updateButtons() {
-  $('btn-undo').disabled = busy || (!undoStack.length && !simMode);
-  $('btn-redo').disabled = busy || !redoStack.length || !!simMode;
-  for (const id of ['btn-replay', 'btn-unfold', 'btn-refold']) $(id).disabled = busy || (!state.steps.length && !simMode);
+  $('btn-undo').disabled = busy || !undoStack.length;
+  $('btn-redo').disabled = busy || !redoStack.length;
+  for (const id of ['btn-replay', 'btn-unfold', 'btn-refold']) $(id).disabled = busy || !state.steps.length;
   for (const id of ['btn-flip', 'btn-rotate', 'btn-reset']) $(id).disabled = busy;
   for (const b of $('presets').children) b.disabled = busy;
 }
@@ -1327,6 +1143,7 @@ window.addEventListener('keydown', (e) => {
   else if (k === 'c') setSeg('type', 'type', 'crease');
   else if (k === 's') setSeg('type', 'type', 'squash');
   else if (k === 'i') setSeg('type', 'type', 'reverse');
+  else if (k === 'o') setSeg('type', 'type', 'petal');
   else if (k === 'l') { setSeg('input', 'input', 'line'); cancelInput(); }
   else if (k === 'p') { setSeg('input', 'input', 'point'); cancelInput(); }
   else if (k === 'a') setSeg('mode', 'mode', 'all');
@@ -1358,23 +1175,6 @@ function drawCreasePattern() {
   g.fillStyle = ui.frontColor + '22';
   g.fillRect(tx(-pw / 2), ty(ph / 2), pw * scale, ph * scale);
 
-  if (simMode) {
-    g.lineWidth = 2;
-    g.strokeStyle = '#2b2622';
-    g.strokeRect(tx(-pw / 2), ty(ph / 2), pw * scale, ph * scale);
-    const uv = simMode.model.uv;
-    for (const [i, j, type] of simMode.model.creaseLines) {
-      g.strokeStyle = type === 'V' ? '#2f6fd6' : '#d2392b';
-      g.setLineDash(type === 'V' ? [10, 6] : [10, 4, 2, 4]);
-      g.lineWidth = 1.8;
-      g.beginPath();
-      g.moveTo(tx(uv[i][0]), ty(uv[i][1]));
-      g.lineTo(tx(uv[j][0]), ty(uv[j][1]));
-      g.stroke();
-    }
-    g.setLineDash([]);
-    return;
-  }
 
   // 表が上を向いている面を少し濃く
   for (const f of state.faces) {
@@ -1471,7 +1271,6 @@ window.__origami = {
   get state() { return state; },
   get busy() { return busy; },
   playPreset: (id) => playPreset(PRESETS.find((p) => p.id === id)),
-  get simMode() { return simMode; },
   bgm,
   setView,
   camera,

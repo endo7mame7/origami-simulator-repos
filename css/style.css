@@ -43,6 +43,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 #toolbar .seg button[data-value="crease"].on { background: #6b5a4e; border-color: #6b5a4e; }
 #toolbar .seg button[data-value="squash"].on { background: #7a3fb0; border-color: #7a3fb0; }
 #toolbar .seg button[data-value="reverse"].on { background: #0f8a6a; border-color: #0f8a6a; }
+#toolbar .seg button[data-value="petal"].on { background: #c06a12; border-color: #c06a12; }
 .ver { color: var(--muted); font-size: 11px; margin-left: 4px; }
 
 #toast {

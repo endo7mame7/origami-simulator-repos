@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createPaper, fold, flip, rotate, makeLine, bisectorLine, sideOf, totalArea,
-  poseFaces, creasePattern, isFrontUp, bounds,
+  poseFaces, creasePattern, isFrontUp, bounds, checkConnectivity,
 } from '../js/paper.js';
 import { PRESETS, applyOp } from '../js/presets.js';
 
@@ -104,6 +104,9 @@ for (const preset of PRESETS.filter((p) => p.kind !== 'sim')) {
       s = r.state;
     }
     assert.ok(close(totalArea(s), 4, 1e-6));
-    assert.equal(s.steps.length, preset.steps.length);
+    // つぶし折りなどは内部で複数の手順になるので、まとまりの数で比べる
+    const groups = new Set(s.steps.map((st, i) => st.group ?? `single-${i}`));
+    assert.equal(groups.size, preset.steps.length);
+    assert.deepEqual(checkConnectivity(s, 1e-3), [], '紙が破れていない');
   });
 }
