@@ -33,6 +33,7 @@
             <button data-value="crease" title="折ってから開き、折り筋だけ残す (C)">折り筋</button>
             <button data-value="squash" title="袋を開いてつぶす（つぶし折り）(S)">袋をつぶす</button>
             <button data-value="reverse" title="袋の先を内側に折り込む（中割り折り）(I)">中割り</button>
+            <button data-value="petal" title="下の角を持ち上げ、左右を内側に折り込む（花弁折り）(O)">花弁折り</button>
           </div>
           <div class="seg" data-group="mode">
             <button data-value="all" class="on" title="重なっている紙をまとめて折る (A)">全部の層</button>
@@ -73,7 +74,6 @@
         </div>
         <ol id="steps"></ol>
         <p class="muted small">スライダーで各手順の開き具合を変えられます。</p>
-        <p id="sim-note" class="muted small" hidden>鶴は展開図から物理シミュレーションで一度に折っています。展開図：Origami Simulator（Amanda Ghassaei, MIT License）</p>
       </section>
 
       <section>
@@ -138,10 +138,11 @@
           <li><b>折り筋</b>：折ってすぐ開き、筋だけ残します。筋の端・交点・筋の上にも吸い付きます。</li>
           <li><b>袋をつぶす</b>：2 枚が折り目でつながった「袋」のつけ根に線を引き、袋をクリック。袋を開いて左右対称につぶします。</li>
           <li><b>中割り</b>：袋の途中に線を引いて、先の側をクリック。先を内側に折り込みます。</li>
+          <li><b>花弁折り</b>：正方基本形の 1 枚目に、花弁のつけ根の横線を引き、下の角の側をクリック。</li>
           <li><b>上だけ</b>：クリックした所の一番上の部分を折ります。その上に乗っている紙も一緒に折れます（紙を突き抜けないように）。</li>
           <li>角や辺の中点には自動で吸い付きます。<kbd>Shift</kbd> で角度を 22.5° 単位に。</li>
           <li>右ドラッグ／2 本指で視点を回転、ホイール／ピンチで拡大縮小。</li>
-          <li><kbd>L</kbd> 線 / <kbd>P</kbd> 点→点 / <kbd>V</kbd> 谷 / <kbd>M</kbd> 山 / <kbd>C</kbd> 折り筋 / <kbd>S</kbd> 袋をつぶす / <kbd>I</kbd> 中割り</li>
+          <li><kbd>L</kbd> 線 / <kbd>P</kbd> 点→点 / <kbd>V</kbd> 谷 / <kbd>M</kbd> 山 / <kbd>C</kbd> 折り筋 / <kbd>S</kbd> 袋をつぶす / <kbd>I</kbd> 中割り / <kbd>O</kbd> 花弁折り</li>
           <li><kbd>A</kbd> 全部の層 / <kbd>T</kbd> 上だけ / <kbd>F</kbd> 裏返す / <kbd>R</kbd> 回す / <kbd>B</kbd> BGM / <kbd>Esc</kbd> 取り消し</li>
         </ul>
       </section>
