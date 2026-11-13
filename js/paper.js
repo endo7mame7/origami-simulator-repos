@@ -105,6 +105,7 @@ export function createPaper(width = 2, height = 2) {
     height,
     faces: [{ id: 0, verts, layer: 0, moves: [] }],
     steps: [],
+    creaseMarks: [], // 折り筋（展開図上の線分 {a:{u,v}, b:{u,v}}）
     nextId: 1,
   };
 }
@@ -210,6 +211,99 @@ export function sharedEdge(fa, fb) {
   return null;
 }
 
+
+// ---------------------------------------------------------------- 部分の選択と重なり
+
+// 2 つの凸多角形（平らな状態の xy）が重なっている面積
+export function overlapArea(fa, fb) {
+  let poly = fa.verts.map((v) => ({ x: v.x, y: v.y }));
+  const B = fb.verts;
+  const sb = Math.sign(signedArea(B)) || 1;
+  for (let i = 0; i < B.length && poly.length; i++) {
+    const a = B[i];
+    const b = B[(i + 1) % B.length];
+    const inside = (p) => sb * cross2(b.x - a.x, b.y - a.y, p.x - a.x, p.y - a.y) > 1e-12;
+    const next = [];
+    for (let j = 0; j < poly.length; j++) {
+      const p = poly[j];
+      const q = poly[(j + 1) % poly.length];
+      const ip = inside(p);
+      const iq = inside(q);
+      if (ip) next.push(p);
+      if (ip !== iq) {
+        const d1 = cross2(b.x - a.x, b.y - a.y, p.x - a.x, p.y - a.y);
+        const d2 = cross2(b.x - a.x, b.y - a.y, q.x - a.x, q.y - a.y);
+        const t = d1 / (d1 - d2);
+        next.push({ x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t });
+      }
+    }
+    poly = next;
+  }
+  return poly.length < 3 ? 0 : Math.abs(signedArea(poly));
+}
+
+function onLine(line, v) {
+  return Math.abs(sideOf(line, v)) < 1e-7;
+}
+
+// 2 つの面が、折り線の上にない辺でつながっているか
+function connectedOffLine(fa, fb, line) {
+  const e = sharedEdge(fa, fb);
+  if (!e) return false;
+  if (!line) return true;
+  return !(onLine(line, e[0]) && onLine(line, e[1]));
+}
+
+/**
+ * pick の位置の一番上（または一番下）の紙と、それにつながっている部分を選ぶ。
+ * carry: 'above' なら、選んだ部分の上に重なっている紙も一緒に動かす（紙を突き抜けないように）。
+ *        'below' なら下に重なっている紙も一緒に動かす。
+ * excludeLine: この線の上の辺ではつながっていないとみなす（袋のつけ根など）
+ */
+export function selectComponent(candidates, pick, { carry = 'none', excludeLine = null } = {}) {
+  if (!pick) return { error: '折る部分を選んでください' };
+  const under = candidates.filter((p) => pointInFace(p.face, pick));
+  if (under.length === 0) return { error: 'その位置に紙がありません' };
+  const pickBottom = pick.select === 'bottom';
+  under.sort((a, b) => (pickBottom ? a.face.layer - b.face.layer : b.face.layer - a.face.layer));
+  const seed = under[0];
+  const set = new Set([seed]);
+  const grow = (start) => {
+    const queue = [...start];
+    while (queue.length) {
+      const cur = queue.pop();
+      for (const c of candidates) {
+        if (set.has(c)) continue;
+        if (connectedOffLine(cur.face, c.face, excludeLine)) {
+          set.add(c);
+          queue.push(c);
+        }
+      }
+    }
+  };
+  grow([seed]);
+  if (carry !== 'none') {
+    // 上（下）に重なっている紙を、増えなくなるまで取り込む
+    for (let changed = true; changed;) {
+      changed = false;
+      const added = [];
+      for (const c of candidates) {
+        if (set.has(c)) continue;
+        for (const m of set) {
+          const blocks = carry === 'above' ? c.face.layer > m.face.layer : c.face.layer < m.face.layer;
+          if (blocks && overlapArea(c.face, m.face) > 1e-8) { added.push(c); break; }
+        }
+      }
+      if (added.length) {
+        for (const c of added) set.add(c);
+        grow(added);
+        changed = true;
+      }
+    }
+  }
+  return { set, seed };
+}
+
 // ---------------------------------------------------------------- 折る
 
 function normalizeLayers(faces) {
@@ -247,25 +341,9 @@ export function fold(state, opts) {
   const candidates = pieces.filter((p) => p.side === side);
   let moving;
   if (mode === 'component') {
-    if (!pick) return { error: '折る部分を選んでください' };
-    const under = candidates.filter((p) => pointInFace(p.face, pick));
-    if (under.length === 0) return { error: 'その位置に紙がありません' };
-    const pickBottom = pick.select === 'bottom';
-    under.sort((a, b) => (pickBottom ? a.face.layer - b.face.layer : b.face.layer - a.face.layer));
-    const seed = under[0];
-    const set = new Set([seed]);
-    const queue = [seed];
-    while (queue.length) {
-      const cur = queue.pop();
-      for (const c of candidates) {
-        if (set.has(c)) continue;
-        if (sharedEdge(cur.face, c.face)) {
-          set.add(c);
-          queue.push(c);
-        }
-      }
-    }
-    moving = set;
+    const r = selectComponent(candidates, pick, { carry: type === 'mountain' ? 'below' : 'above' });
+    if (r.error) return r;
+    moving = r.set;
   } else {
     moving = new Set(candidates);
   }
@@ -333,6 +411,308 @@ export function fold(state, opts) {
       nextId,
     },
   };
+}
+
+
+// ---------------------------------------------------------------- 折り筋
+
+// fold() の結果から、実際に折れた部分の折り線（展開図上の線分）を取り出す
+export function creaseMarksFromFold(result, line) {
+  const idx = result.steps.length - 1;
+  const marks = [];
+  const seen = new Set();
+  for (const f of result.faces) {
+    if (!f.moves.includes(idx)) continue;
+    const vs = f.verts;
+    for (let i = 0; i < vs.length; i++) {
+      const a = vs[i];
+      const b = vs[(i + 1) % vs.length];
+      if (!onLine(line, a) || !onLine(line, b)) continue;
+      if (Math.hypot(a.u - b.u, a.v - b.v) < 1e-6) continue;
+      const key = [a.u, a.v, b.u, b.v].map((x) => x.toFixed(5)).join(',');
+      const key2 = [b.u, b.v, a.u, a.v].map((x) => x.toFixed(5)).join(',');
+      if (seen.has(key) || seen.has(key2)) continue;
+      seen.add(key);
+      marks.push({ a: { u: a.u, v: a.v }, b: { u: b.u, v: b.v } });
+    }
+  }
+  return marks;
+}
+
+// 折って開く（折り筋だけを残す）。状態に折り筋を足したものを返す
+export function addCrease(state, opts) {
+  const r = fold(state, { ...opts, type: 'valley' });
+  if (r.error) return r;
+  const marks = creaseMarksFromFold(r.state, opts.line);
+  return { folded: r.state, marks, state: { ...cloneState(state), creaseMarks: [...(state.creaseMarks ?? []), ...marks] } };
+}
+
+// 面の展開図座標 (u,v) → 別の座標（平らな xy や 3D）への写像を、面の 3 頂点から作る
+export function faceAffine(face, targets) {
+  const vs = face.verts;
+  let best = [0, 1, 2];
+  let bestA = 0;
+  for (let i = 1; i < vs.length - 1; i++) {
+    for (let j = i + 1; j < vs.length; j++) {
+      const a = Math.abs(cross2(vs[i].u - vs[0].u, vs[i].v - vs[0].v, vs[j].u - vs[0].u, vs[j].v - vs[0].v));
+      if (a > bestA) { bestA = a; best = [0, i, j]; }
+    }
+  }
+  const [i0, i1, i2] = best;
+  const A = vs[i0], B = vs[i1], C = vs[i2];
+  const det = (B.u - A.u) * (C.v - A.v) - (C.u - A.u) * (B.v - A.v);
+  const T0 = targets[i0], T1 = targets[i1], T2 = targets[i2];
+  return (u, v) => {
+    const s = ((u - A.u) * (C.v - A.v) - (C.u - A.u) * (v - A.v)) / det;
+    const t = ((B.u - A.u) * (v - A.v) - (u - A.u) * (B.v - A.v)) / det;
+    return T0.map((x, k) => x + (T1[k] - x) * s + (T2[k] - x) * t);
+  };
+}
+
+// 展開図上の線分を、面（展開図上で凸多角形）の内側に切り取る。[t0, t1] か null
+export function clipToFaceUV(face, a, b) {
+  let t0 = 0;
+  let t1 = 1;
+  const vs = face.verts;
+  const sgn = Math.sign(signedArea(vs, 'uv')) || 1;
+  const du = b.u - a.u;
+  const dv = b.v - a.v;
+  for (let i = 0; i < vs.length; i++) {
+    const p = vs[i];
+    const q = vs[(i + 1) % vs.length];
+    const ex = q.u - p.u;
+    const ey = q.v - p.v;
+    const num = sgn * cross2(ex, ey, a.u - p.u, a.v - p.v); // >= 0 で内側
+    const den = sgn * cross2(ex, ey, du, dv);
+    if (Math.abs(den) < 1e-12) {
+      if (num < -1e-9) return null;
+      continue;
+    }
+    const t = -num / den;
+    if (den > 0) t0 = Math.max(t0, t); else t1 = Math.min(t1, t);
+    if (t0 > t1 - 1e-9) return null;
+  }
+  return [t0, t1];
+}
+
+// 折り筋を、今の平らな状態の xy 座標の線分にする
+export function creaseSegmentsXY(state) {
+  const out = [];
+  const marks = state.creaseMarks ?? [];
+  if (!marks.length) return out;
+  for (const f of state.faces) {
+    const map = faceAffine(f, f.verts.map((v) => [v.x, v.y]));
+    for (const m of marks) {
+      const r = clipToFaceUV(f, m.a, m.b);
+      if (!r) continue;
+      const at = (t) => map(m.a.u + (m.b.u - m.a.u) * t, m.a.v + (m.b.v - m.a.v) * t);
+      const [x1, y1] = at(r[0]);
+      const [x2, y2] = at(r[1]);
+      if (Math.hypot(x2 - x1, y2 - y1) < 1e-6) continue;
+      out.push({ a: { x: x1, y: y1 }, b: { x: x2, y: y2 }, layer: f.layer });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- 袋を開いてつぶす・中割り折り
+
+function splitAll(state, line) {
+  const pieces = [];
+  state.faces.forEach((face, src) => {
+    const { pos, neg } = splitFace(face, line);
+    const split = !!(pos && neg);
+    if (pos) pieces.push({ face: pos, side: 1, src, split });
+    if (neg) pieces.push({ face: neg, side: -1, src, split });
+  });
+  return pieces;
+}
+
+function lineIntersect(l1, l2) {
+  const den = cross2(l1.d.x, l1.d.y, l2.d.x, l2.d.y);
+  if (Math.abs(den) < 1e-9) return null;
+  const t = cross2(l2.p.x - l1.p.x, l2.p.y - l1.p.y, l2.d.x, l2.d.y) / den;
+  return { x: l1.p.x + l1.d.x * t, y: l1.p.y + l1.d.y * t };
+}
+
+const reflectVerts = (verts, line) => verts.map((v) => {
+  const r = reflectPoint(line, v);
+  return { x: r.x, y: r.y, u: v.u, v: v.v };
+});
+
+function centroid(face) {
+  const n = face.verts.length;
+  return {
+    x: face.verts.reduce((s, v) => s + v.x, 0) / n,
+    y: face.verts.reduce((s, v) => s + v.y, 0) / n,
+  };
+}
+
+// 選んだ部分以外の分割をやめて、面の一覧を作る
+function assemble(state, pieces, moving) {
+  const movedSrc = new Set([...moving].map((p) => p.src));
+  const keep = [];
+  const handled = new Set();
+  for (const p of pieces) {
+    if (moving.has(p)) continue;
+    if (p.split && !movedSrc.has(p.src)) {
+      if (handled.has(p.src)) continue;
+      handled.add(p.src);
+      keep.push({ ...state.faces[p.src], verts: state.faces[p.src].verts.map((v) => ({ ...v })), moves: [...state.faces[p.src].moves] });
+    } else {
+      keep.push({ ...p.face, verts: p.face.verts.map((v) => ({ ...v })), moves: [...p.face.moves], id: p.split ? null : p.face.id });
+    }
+  }
+  return keep;
+}
+
+function finish(state, faces, newSteps) {
+  let nextId = state.nextId;
+  for (const f of faces) if (f.id === null || f.id === undefined) f.id = nextId++;
+  normalizeLayers(faces);
+  return { state: { ...state, faces, steps: [...state.steps.map((s) => ({ ...s })), ...newSteps], nextId } };
+}
+
+const stepFor = (line, k, extra) => ({
+  kind: 'fold', p: { ...line.p }, d: { ...line.d }, k, angle: 180, ...extra,
+});
+
+/**
+ * 袋を開いてつぶす（つぶし折り）。
+ * line: 袋（2 枚重なったフラップ）のつけ根の線。side: 袋のある側。pick: 袋の上の点。
+ * 袋の背（2 枚をつなぐ折り目）が、つけ根の線の上に来るように開いてつぶす。
+ */
+export function squash(state, { line, side, pick }) {
+  if (!line) return { error: '線が短すぎます' };
+  const pieces = splitAll(state, line);
+  const candidates = pieces.filter((p) => p.side === side);
+  const sel = selectComponent(candidates, pick, { excludeLine: line });
+  if (sel.error) return sel;
+  const flap = [...sel.set];
+  const up1 = isFrontUp(sel.seed.face);
+  const L1 = flap.filter((p) => isFrontUp(p.face) === up1); // 上の 1 枚（反対側へ開く）
+  const L2 = flap.filter((p) => isFrontUp(p.face) !== up1); // 下の 1 枚（その場に残る）
+  if (!L2.length) return { error: '袋になっていません（2 枚が折り目でつながった部分を選んでください）' };
+
+  // 袋の背（L1 と L2 をつなぐ折り目）
+  let spine = null;
+  for (const a of L1) {
+    for (const b of L2) {
+      const e = sharedEdge(a.face, b.face);
+      if (e && !(onLine(line, e[0]) && onLine(line, e[1]))) { spine = e; break; }
+    }
+    if (spine) break;
+  }
+  if (!spine) return { error: '袋の背（2 枚をつなぐ折り目）が見つかりません' };
+  const spineLine = makeLine(spine[0], spine[1]);
+  const O = lineIntersect(spineLine, line);
+  if (!O) return { error: '袋の背とつけ根が平行なので、つぶせません' };
+  const far = Math.hypot(spine[0].x - O.x, spine[0].y - O.y) > Math.hypot(spine[1].x - O.x, spine[1].y - O.y) ? spine[0] : spine[1];
+  const sl = Math.hypot(far.x - O.x, far.y - O.y);
+  const s = { x: (far.x - O.x) / sl, y: (far.y - O.y) / sl };
+  // 袋の内側の角（背とつけ根の間）を二等分する線
+  const c = flap.reduce((acc, p) => { const q = centroid(p.face); return { x: acc.x + q.x, y: acc.y + q.y }; }, { x: 0, y: 0 });
+  c.x = c.x / flap.length - O.x; c.y = c.y / flap.length - O.y;
+  let d = null;
+  for (const sg of [1, -1]) {
+    const dd = { x: line.d.x * sg, y: line.d.y * sg };
+    const w = cross2(s.x, s.y, dd.x, dd.y);
+    if (Math.abs(w) < 1e-9) continue;
+    if (Math.sign(cross2(s.x, s.y, c.x, c.y)) === Math.sign(w) && Math.sign(cross2(c.x, c.y, dd.x, dd.y)) === Math.sign(w)) d = dd;
+  }
+  if (!d) return { error: '袋の向きがわかりません' };
+  const bl = Math.hypot(s.x + d.x, s.y + d.y);
+  if (bl < 1e-6) return { error: 'この袋はつぶせません' };
+  const bis = { p: O, d: { x: (s.x + d.x) / bl, y: (s.y + d.y) / bl } };
+  const spineSide = Math.sign(sideOf(bis, { x: O.x + s.x, y: O.y + s.y }));
+
+  const base = state.steps.length;
+  const iA = base; // 下の 1 枚の背側を二等分線で折る
+  const iB = base + 1; // 上の 1 枚の背側を二等分線で折る
+  const iC = base + 2; // 上の 1 枚をつけ根で反対側へ
+  const faces = assemble(state, pieces, sel.set);
+  const maxAll = Math.max(...state.faces.map((f) => f.layer));
+  const lay = (arr) => ({ max: Math.max(...arr.map((p) => p.face.layer)) });
+  const m1 = lay(L1).max;
+  const m2 = lay(L2).max;
+  for (const p of flap) {
+    const inL1 = L1.includes(p);
+    const { pos, neg } = splitFace(p.face, bis);
+    for (const [part, sgn] of [[pos, 1], [neg, -1]]) {
+      if (!part) continue;
+      const isSpine = sgn === spineSide;
+      let verts = part.verts.map((v) => ({ ...v }));
+      const moves = [...p.face.moves];
+      let layer = part.layer;
+      if (isSpine) {
+        verts = reflectVerts(verts, bis);
+        moves.push(inL1 ? iB : iA);
+      }
+      if (inL1) {
+        verts = reflectVerts(verts, line);
+        moves.push(iC);
+        layer = maxAll + (isSpine ? 200 : 100) + (m1 - part.layer);
+      } else if (isSpine) {
+        layer = maxAll + 300 + (m2 - part.layer);
+      }
+      faces.push({ id: null, verts, layer, moves });
+    }
+  }
+  const g = `squash-${base}`;
+  const steps = [
+    stepFor(bis, { x: bis.d.x * spineSide, y: bis.d.y * spineSide }, { type: 'squash', group: g, label: '袋を開いてつぶす' }),
+    stepFor(bis, { x: bis.d.x * spineSide, y: bis.d.y * spineSide }, { type: 'squash', group: g }),
+    stepFor(line, { x: line.d.x * side, y: line.d.y * side }, { type: 'squash', group: g }),
+  ];
+  return finish(state, faces, steps);
+}
+
+/**
+ * 中割り折り（袋の先を、折り線で内側に折り込む）。
+ * line: 折り線。side: 折り込む先の側。pick: 袋の上の点。
+ */
+export function reverseFold(state, { line, side, pick }) {
+  if (!line) return { error: '線が短すぎます' };
+  const pieces = splitAll(state, line);
+  const candidates = pieces.filter((p) => p.side === side);
+  const sel = selectComponent(candidates, pick, { excludeLine: line });
+  if (sel.error) return sel;
+  const flap = [...sel.set];
+  const up1 = isFrontUp(sel.seed.face);
+  const G1 = flap.filter((p) => isFrontUp(p.face) === up1); // 手前の面
+  const G2 = flap.filter((p) => isFrontUp(p.face) !== up1); // 奥の面
+  if (!G2.length) return { error: '中割り折りには、2 枚が折り目でつながった部分（袋）を選んでください' };
+  // 折り線の反対側で、それぞれとつながっている紙の重なり位置
+  const stay = pieces.filter((p) => !sel.set.has(p));
+  const partnerLayer = (group, pickMax) => {
+    const ls = [];
+    for (const p of group) for (const q of stay) if (sharedEdge(p.face, q.face)) ls.push(q.face.layer);
+    if (!ls.length) return null;
+    return pickMax ? Math.max(...ls) : Math.min(...ls);
+  };
+  const top = partnerLayer(G1, false);
+  const bot = partnerLayer(G2, true);
+  if (top === null || bot === null) return { error: '折り線の反対側とつながっていません。袋の途中に線を引いてください' };
+  if (top <= bot) return { error: 'この向きでは中割り折りできません' };
+  const base = state.steps.length;
+  const faces = assemble(state, pieces, sel.set);
+  const n = flap.length + 2;
+  const max1 = Math.max(...G1.map((p) => p.face.layer));
+  const min2 = Math.min(...G2.map((p) => p.face.layer));
+  for (const p of flap) {
+    const inG1 = G1.includes(p);
+    const f = p.face;
+    const layer = inG1
+      ? top - (1 + (max1 - f.layer)) / (2 * n)
+      : bot + (1 + (f.layer - min2)) / (2 * n);
+    faces.push({ id: null, verts: reflectVerts(f.verts, line), layer, moves: [...f.moves, inG1 ? base : base + 1] });
+  }
+  const g = `reverse-${base}`;
+  const steps = [
+    stepFor(line, { x: -line.d.x * side, y: -line.d.y * side }, { type: 'reverse', group: g, label: '中割り折り' }),
+    stepFor(line, { x: line.d.x * side, y: line.d.y * side }, { type: 'reverse', group: g }),
+  ];
+  return finish(state, faces, steps);
 }
 
 // 紙全体を裏返す（縦の軸まわりに 180° 回す）
